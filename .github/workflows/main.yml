@@ -11,6 +11,7 @@ on:
     - cron: '46 7 * * 1-5'
     - cron: '46 8 * * 1-5'
     - cron: '46 9 * * 1-5'
+    - cron: '45 14 * * 1-5'
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 jobs:
