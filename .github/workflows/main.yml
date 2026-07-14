@@ -1,0 +1,34 @@
+name: Hourly NSE Sheet Update
+
+on:
+  schedule:
+    # Cron times are in UTC. IST = UTC + 5:30.
+    # These fire at 9:16, 10:16, 11:16, 12:16, 13:16, 14:16, 15:16 IST, Mon-Fri
+    - cron: '46 3 * * 1-5'
+    - cron: '46 4 * * 1-5'
+    - cron: '46 5 * * 1-5'
+    - cron: '46 6 * * 1-5'
+    - cron: '46 7 * * 1-5'
+    - cron: '46 8 * * 1-5'
+    - cron: '46 9 * * 1-5'
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  update-sheet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run updater
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: python nse_updater.py
