@@ -2,11 +2,10 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 import requests
-import zipfile
-import io
 from datetime import datetime, timedelta
 import os
 import json
+import time
 
 # ============================================================
 # 1. Credentials Setup
@@ -34,57 +33,78 @@ except Exception as e:
 
 
 # ============================================================
-# 2. NSE UDiFF Data Fetcher
+# 2. NSE Live Market Data Fetcher
 # ============================================================
-def fetch_bhavcopy_for_date(date_obj):
-    date_str = date_obj.strftime("%Y%m%d")
-    url = f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{date_str}_F_0000.csv.zip"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    print(f"--- Date {date_obj.strftime('%d-%m-%Y')} checking ---")
+# NSE's site requires a valid session/cookies before its API will respond
+# (a plain request without visiting the homepage first gets rejected).
+# We use the "NIFTY TOTAL MARKET" index snapshot, which covers ~750 of the
+# most liquid NSE equities with live volume/turnover - broad enough to
+# reliably contain the top 250 by volume and by turnover at any point
+# in the session.
+NSE_HOME_URL = "https://www.nseindia.com"
+NSE_LIVE_API_URL = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20TOTAL%20MARKET"
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.nseindia.com/market-data/live-equity-market',
+}
+
+
+def fetch_live_market_data():
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            print("File Found! Now Opening...")
-            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                csv_filename = z.namelist()[0]
-                with z.open(csv_filename) as f:
-                    df = pd.read_csv(f)
+        # Step 1: hit the homepage first to pick up NSE's session cookies
+        session.get(NSE_HOME_URL, timeout=15)
+        time.sleep(1)  # brief pause - firing the API immediately after can get rejected
 
-                    sym_col = 'TckrSymb' if 'TckrSymb' in df.columns else 'SYMBOL'
-                    close_col = 'ClsPric' if 'ClsPric' in df.columns else 'CLOSE'
-                    series_col = 'SctySrs' if 'SctySrs' in df.columns else 'SERIES'
+        # Step 2: call the live index snapshot API using that session
+        response = session.get(NSE_LIVE_API_URL, timeout=15)
+        print(f"    Status: {response.status_code} | Content-Type: {response.headers.get('Content-Type')}")
 
-                    vol_col = 'TtlTradgVol'
-                    for c in ['TtlTradgVol', 'TOTTRDQTY', 'TtlTrdQty', 'TotTrdQty']:
-                        if c in df.columns:
-                            vol_col = c
-                            break
-
-                    turnover_col = 'TtlTrfVal'
-                    for c in ['TtlTrfVal', 'TOTTRDVAL', 'TtlTrdVal', 'TotTrdVal']:
-                        if c in df.columns:
-                            turnover_col = c
-                            break
-
-                    if series_col in df.columns:
-                        df = df[df[series_col].astype(str).str.strip() == 'EQ']
-
-                    filter_keywords = 'BEES|ETF|GOLD|LIQUID|CASE|SILVER|LIQ'
-                    df = df[~df[sym_col].astype(str).str.contains(filter_keywords, case=False, na=False)]
-
-                    df_vol = df.sort_values(by=vol_col, ascending=False).head(250)
-                    data_vol = df_vol[[sym_col, vol_col, close_col]].values.tolist()
-
-                    df_turnover = df.sort_values(by=turnover_col, ascending=False).head(250)
-                    data_turnover = df_turnover[[sym_col, turnover_col, close_col]].values.tolist()
-
-                    return data_vol, data_turnover
-        else:
-            print(f"NSE Server {response.status_code} sent the response")
+        if response.status_code != 200:
+            snippet = response.content[:200]
+            print(f"    Body snippet: {snippet}")
             return None, None
+
+        payload = response.json()
+        rows = payload.get('data', [])
+        if not rows:
+            print("No data rows returned by NSE API")
+            return None, None
+
+        df = pd.DataFrame(rows)
+
+        # Filter only equity series (EQ)
+        if 'series' in df.columns:
+            df = df[df['series'].astype(str).str.strip() == 'EQ']
+
+        # Remove ETFs / gold / liquid / silver funds, same as before
+        filter_keywords = 'BEES|ETF|GOLD|LIQUID|CASE|SILVER|LIQ'
+        df = df[~df['symbol'].astype(str).str.contains(filter_keywords, case=False, na=False)]
+
+        # NSE's live API uses these field names for volume/turnover/last price
+        vol_col = 'totalTradedVolume'
+        turnover_col = 'totalTradedValue'
+        price_col = 'lastPrice'
+
+        missing = [c for c in (vol_col, turnover_col, price_col) if c not in df.columns]
+        if missing:
+            print(f"Expected columns missing from NSE response: {missing}")
+            return None, None
+
+        df_vol = df.sort_values(by=vol_col, ascending=False).head(250)
+        data_vol = df_vol[['symbol', vol_col, price_col]].values.tolist()
+
+        df_turnover = df.sort_values(by=turnover_col, ascending=False).head(250)
+        data_turnover = df_turnover[['symbol', turnover_col, price_col]].values.tolist()
+
+        return data_vol, data_turnover
+
     except Exception as e:
         print(f"Error: {e}")
         return None, None
@@ -93,37 +113,11 @@ def fetch_bhavcopy_for_date(date_obj):
 # ============================================================
 # 3. Execution: fetch + update sheets (single pass)
 # ============================================================
-date = datetime.now()
-data_vol_to_insert = None
-data_turnover_to_insert = None
-fetched_date_str = ""
-
-for i in range(7):
-    test_date = date - timedelta(days=i)
-    if test_date.weekday() >= 5:  # Skip Sat/Sun
-        continue
-
-    data_vol, data_turnover = fetch_bhavcopy_for_date(test_date)
-    if data_vol and data_turnover:
-        data_vol_to_insert = data_vol
-        data_turnover_to_insert = data_turnover
-        fetched_date_str = test_date.strftime('%d-%b-%Y')
-        break
+data_vol_to_insert, data_turnover_to_insert = fetch_live_market_data()
 
 if not (data_vol_to_insert and data_turnover_to_insert):
-    print("FAILED: File not found from Last 7 days")
+    print("FAILED: Could not fetch live NSE market data")
     exit(1)
-
-# Skip the write if this trading day's data is already on the sheet
-# (reads the existing status cell to check)
-try:
-    existing_status = ws_volume.acell('K2').value or ""
-except Exception:
-    existing_status = ""
-
-if existing_status.startswith(f"Data Date: {fetched_date_str}"):
-    print(f"SKIP: Data for {fetched_date_str} already on the sheet - no change.")
-    exit(0)
 
 try:
     # A. Update Volume Sheet
@@ -136,12 +130,12 @@ try:
 
     # Update Timestamp
     ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime('%d-%b %H:%M')
-    status_msg = f"Data Date: {fetched_date_str} | Last Update: {ist_now} (IST)"
+    status_msg = f"Live Snapshot | Last Update: {ist_now} (IST)"
 
     ws_volume.update('K2', [[status_msg]])
     ws_turnover.update('K2', [[status_msg]])
 
-    print(f"SUCCESS: Both Sheets (Volume and Turnover) {fetched_date_str} updated !")
+    print(f"SUCCESS: Both Sheets (Volume and Turnover) updated with live data at {ist_now} IST!")
 except Exception as e:
     print(f"Google Sheet update error: {e}")
     exit(1)
